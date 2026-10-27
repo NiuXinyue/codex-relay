@@ -1,0 +1,275 @@
+name: Build iPhone IPA (unsigned)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build for iOS 18.2.1 and SideLoop
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      CI: "1"
+      EXPO_NO_TELEMETRY: "1"
+      SHARP_IGNORE_GLOBAL_LIBVIPS: "1"
+      EXPO_PUBLIC_HOT_UPDATER_BASE_URL: ""
+      EXPO_PUBLIC_HOT_UPDATER_API_KEY: ""
+      HOT_UPDATER_API_KEY: ""
+      TARGET_IOS: "18.2.1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode 27.1 or newer
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob, os, pathlib, re, subprocess
+          candidates = []
+          for app in glob.glob('/Applications/Xcode*.app'):
+              developer = str(pathlib.Path(app) / 'Contents/Developer')
+              env = dict(os.environ, DEVELOPER_DIR=developer)
+              result = subprocess.run(['xcodebuild', '-version'], env=env, text=True, capture_output=True)
+              match = re.search(r'^Xcode (\d+(?:\.\d+)*)', result.stdout, re.M)
+              if result.returncode == 0 and match:
+                  version = tuple(map(int, match[1].split('.')))
+                  print(f'{app}: {match[0]}')
+                  resolved = str(pathlib.Path(app).resolve())
+                  if version >= (27, 1) and not re.search(r'beta|candidate|preview', resolved, re.I):
+                      candidates.append((version, developer))
+          if not candidates:
+              raise SystemExit('Xcode >= 27.1 is required by react-native-arrangement-view. This runner has no compatible Xcode; use a newer xcode-27 image.')
+          developer = min(candidates)[1]
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'DEVELOPER_DIR={developer}\n')
+          PY
+
+      - name: Record toolchain
+        run: |
+          mkdir -p build/diagnostics
+          xcodebuild -version | tee build/diagnostics/xcode-version.txt
+          xcodebuild -showsdks > build/diagnostics/sdks.txt
+          sw_vers > build/diagnostics/macos-version.txt
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.14.1"
+          cache: pnpm
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify downloaded native Markdown resources
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          package = Path('node_modules/react-native-enriched-markdown')
+          required = [
+              package / 'cpp/highlight/vendor/tree-sitter/src/lib.c',
+              package / 'cpp/highlight/vendor/tree-sitter/include/tree_sitter/api.h',
+              package / 'ios/vendor/RaTeX.xcframework/Info.plist',
+          ]
+          missing = [str(path) for path in required if not path.is_file()]
+          if not list((package / 'ios/vendor/Fonts').glob('*.ttf')):
+              missing.append(str(package / 'ios/vendor/Fonts/*.ttf'))
+          if missing:
+              raise SystemExit('Native resource downloads were incomplete. Re-run the build after checking GitHub downloads:\n' + '\n'.join(missing))
+          print('Tree-sitter runtime and RaTeX assets are present.')
+          PYTHON
+
+      - name: Build shared package and embedded web views
+        run: |
+          pnpm --filter codex-relay build
+          pnpm --filter @codex-relay/mobile build:workspace-code-editor
+          pnpm --filter @codex-relay/mobile build:workspace-ssh-terminal
+
+      - name: Set the native deployment target
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('apps/mobile/app.config.ts')
+          text = path.read_text()
+          old = '"expo-build-properties",\n        {\n          android:'
+          new = '"expo-build-properties",\n        {\n          ios: { deploymentTarget: "16.4" },\n          android:'
+          if text.count(old) != 1:
+              raise SystemExit('Upstream Expo config changed; review the deployment-target override.')
+          path.write_text(text.replace(old, new))
+          PY
+
+      - name: Generate the iOS project without cloud credentials
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --platform ios --no-install
+
+      - name: Install native pods
+        working-directory: apps/mobile/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          pod install 2>&1 | tee "$GITHUB_WORKSPACE/build/diagnostics/pod-install.log"
+
+      - name: Find the application workspace and scheme
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          workspaces = list(pathlib.Path('apps/mobile/ios').glob('*.xcworkspace'))
+          projects = list(pathlib.Path('apps/mobile/ios').glob('*.xcodeproj'))
+          if len(workspaces) != 1 or len(projects) != 1:
+              raise SystemExit(f'Expected one app workspace/project, got {workspaces} / {projects}')
+          workspace, project = workspaces[0], projects[0]
+          result = subprocess.run(['xcodebuild', '-list', '-json', '-project', str(project)], check=True, capture_output=True, text=True)
+          pathlib.Path('build/diagnostics/project.json').write_text(result.stdout)
+          schemes = json.loads(result.stdout)['project'].get('schemes', [])
+          scheme = project.stem if project.stem in schemes else (schemes[0] if len(schemes) == 1 else None)
+          if not scheme:
+              raise SystemExit(f'Cannot identify application scheme: {schemes}')
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'IOS_WORKSPACE={workspace}\nIOS_SCHEME={scheme}\n')
+          print(f'Workspace: {workspace}; scheme: {scheme}')
+          PY
+
+      - name: Archive an unsigned arm64 device application
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace "$IOS_WORKSPACE" \
+            -scheme "$IOS_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$GITHUB_WORKSPACE/build/CodexRelay.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/codex-relay-derived" \
+            -resultBundlePath "$GITHUB_WORKSPACE/build/Build.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 \
+            archive 2>&1 | tee build/diagnostics/xcodebuild.log
+
+      - name: Verify device compatibility and package the IPA
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib, plistlib, re, shutil, subprocess, zipfile
+          build = pathlib.Path('build')
+          products = build / 'CodexRelay.xcarchive/Products/Applications'
+          apps = list(products.glob('*.app'))
+          if len(apps) != 1:
+              raise SystemExit(f'Expected one application, found {apps}')
+          app = apps[0]
+          target = tuple(map(int, os.environ['TARGET_IOS'].split('.')))
+          def version(text):
+              parts = tuple(map(int, text.split('.')))
+              return parts + (0,) * (3 - len(parts))
+          info = plistlib.loads((app / 'Info.plist').read_bytes())
+          if not info.get('MinimumOSVersion'):
+              raise SystemExit('Application is missing MinimumOSVersion')
+          if version(info['MinimumOSVersion']) > target:
+              raise SystemExit(f"App minimum iOS {info['MinimumOSVersion']} exceeds {os.environ['TARGET_IOS']}")
+          if 'iPhoneOS' not in info.get('CFBundleSupportedPlatforms', []):
+              raise SystemExit('This is not an iPhoneOS device build')
+          if not (app / 'main.jsbundle').is_file():
+              raise SystemExit('Release JavaScript bundle is missing; this would require Metro')
+          macho_magic = {bytes.fromhex(s) for s in ('cffaedfe', 'cefaedfe', 'feedfacf', 'feedface', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca')}
+          binaries, failures = [], []
+          for path in sorted(app.rglob('*')):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              with path.open('rb') as f:
+                  if f.read(4) not in macho_magic:
+                      continue
+              arches = subprocess.check_output(['xcrun', 'lipo', '-archs', str(path)], text=True).strip().split()
+              if 'arm64' not in arches:
+                  failures.append(f'{path}: arm64 slice missing ({arches})')
+                  continue
+              output = subprocess.check_output(['xcrun', 'otool', '-arch', 'arm64', '-l', str(path)], text=True)
+              minimum = None
+              for chunk in re.split(r'Load command \d+\n', output):
+                  if re.search(r'cmd LC_BUILD_VERSION\s', chunk):
+                      platform = re.search(r'^\s*platform\s+(\S+)', chunk, re.M)
+                      if not platform or platform[1].upper() not in ('2', 'IOS'):
+                          failures.append(f'{path}: not a device iOS Mach-O')
+                      match = re.search(r'^\s*minos\s+([\d.]+)', chunk, re.M)
+                      minimum = match[1] if match else None
+                  elif re.search(r'cmd LC_VERSION_MIN_IPHONEOS\s', chunk):
+                      match = re.search(r'^\s*version\s+([\d.]+)', chunk, re.M)
+                      minimum = match[1] if match else None
+              if not minimum:
+                  failures.append(f'{path}: missing iOS minimum-version load command')
+              elif version(minimum) > target:
+                  failures.append(f'{path}: minimum iOS {minimum} exceeds {os.environ["TARGET_IOS"]}')
+              if re.search(r'^\s*cryptid\s+[1-9]\d*\s*$', output, re.M):
+                  failures.append(f'{path}: FairPlay encrypted executable')
+              binaries.append({'path': str(path.relative_to(app)), 'architectures': arches, 'minimum_ios': minimum})
+          if not any(item['path'] == info['CFBundleExecutable'] for item in binaries):
+              failures.append('Main application executable was not verified')
+          report = {
+              'commit': os.environ['GITHUB_SHA'],
+              'built_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'bundle_id': info['CFBundleIdentifier'],
+              'version': info.get('CFBundleShortVersionString'),
+              'target_ios': os.environ['TARGET_IOS'],
+              'minimum_ios': info['MinimumOSVersion'],
+              'device_build': True,
+              'signed': False,
+              'device_launch_tested': False,
+              'embedded_binaries': binaries,
+              'errors': failures,
+          }
+          (build / 'diagnostics/compatibility.json').write_text(json.dumps(report, indent=2) + '\n')
+          if failures:
+              raise SystemExit('\n'.join(failures))
+          output_dir = build / 'ipa'
+          payload = build / 'ipa-staging/Payload'
+          payload.mkdir(parents=True)
+          output_dir.mkdir(parents=True)
+          staged = payload / app.name
+          shutil.copytree(app, staged, symlinks=True)
+          ipa = (output_dir / 'CodexRelay-unsigned.ipa').resolve()
+          subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(payload), str(ipa)], check=True)
+          with zipfile.ZipFile(ipa) as archive:
+              if f'Payload/{app.name}/Info.plist' not in archive.namelist():
+                  raise SystemExit('Invalid IPA Payload structure')
+          digest = hashlib.sha256(ipa.read_bytes()).hexdigest()
+          (output_dir / 'SHA256SUMS').write_text(f'{digest}  {ipa.name}\n')
+          shutil.copy2(build / 'diagnostics/compatibility.json', output_dir / 'compatibility.json')
+          summary = f'## Unsigned device IPA\n\n- App: {info["CFBundleIdentifier"]}\n- Minimum iOS: {info["MinimumOSVersion"]}\n- Checked against iOS: {os.environ["TARGET_IOS"]}\n- Native binaries checked: {len(binaries)}\n- SHA-256: `{digest}`\n\nDownload **CodexRelay-unsigned-iOS18** and upload the IPA to your local SideLoop. Apple signing and device launch are still required.\n'
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write(summary)
+          PY
+
+      - name: Upload the unsigned IPA and compatibility report
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexRelay-unsigned-iOS18
+          path: build/ipa/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-diagnostics
+          path: build/diagnostics/
+          if-no-files-found: ignore
+          retention-days: 3
