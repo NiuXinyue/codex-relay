@@ -128,10 +128,10 @@ import {
   clearComposerDraft,
   clearThreadStreamReconnectRequest,
   composerThreadKey,
-  getCollaborationMode,
   getComposerAttachments,
   getComposerDraft,
   getComposerSkills,
+  getComposerSubmission,
   moveNewThreadCollaborationMode,
   requestThreadStreamReconnect,
   resetChatSessionState,
@@ -752,7 +752,6 @@ export function ChatScreen({ initialPairingUrl, onPairingComplete }: ChatScreenP
         const missingActiveThreadRestored = Boolean(missingActiveThreadState);
         const nextActiveThreadId = activeThreadAfterRefresh({
           currentActiveThreadId,
-          missingActiveThreadRestored,
           preferFirstThread,
           threads: response.threads,
         });
@@ -1429,16 +1428,20 @@ export function ChatScreen({ initialPairingUrl, onPairingComplete }: ChatScreenP
     collaborationModeOverride?: ThreadCollaborationMode,
   ) {
     const isDraftPrompt = promptOverride === undefined;
-    const composerThreadId = chatStore$.activeThreadId.peek();
-    const draft = getComposerDraft(composerThreadId);
-    const attachments = getComposerAttachments(composerThreadId);
-    const selectedSkills = getComposerSkills(composerThreadId);
+    const submission = getComposerSubmission(activeThreadId);
+    if (!submission) {
+      Alert.alert(
+        "Conversation changed",
+        "Review the selected conversation before sending your message again.",
+      );
+      return;
+    }
+    const { threadId: composerThreadId, draft, attachments, skills: selectedSkills } = submission;
     const pendingAttachments = isDraftPrompt ? attachments : [];
     const pendingSkills = isDraftPrompt ? selectedSkills : [];
     const rawTextPrompt = (promptOverride ?? draft).trim();
     const textPrompt = rawTextPrompt;
-    const requestCollaborationMode =
-      collaborationModeOverride ?? getCollaborationMode(composerThreadId);
+    const requestCollaborationMode = collaborationModeOverride ?? submission.collaborationMode;
     if (!textPrompt && pendingAttachments.length === 0 && pendingSkills.length === 0) {
       return;
     }
@@ -1457,7 +1460,7 @@ export function ChatScreen({ initialPairingUrl, onPairingComplete }: ChatScreenP
 
     const shouldSubmitRunningInput = isRunning && activeThread?.state === "running";
     if (shouldSubmitRunningInput) {
-      if (!isDraftPrompt || !activeThreadId) {
+      if (!isDraftPrompt || !composerThreadId) {
         return;
       }
 
@@ -1466,7 +1469,7 @@ export function ChatScreen({ initialPairingUrl, onPairingComplete }: ChatScreenP
 
       try {
         const response = await submitThreadInputMutation.mutateAsync({
-          threadId: activeThreadId,
+          threadId: composerThreadId,
           body: {
             attachments: requestAttachments,
             prompt,
@@ -1480,7 +1483,7 @@ export function ChatScreen({ initialPairingUrl, onPairingComplete }: ChatScreenP
         });
         const current =
           queryClient.getQueryData<Awaited<ReturnType<typeof serverStateQueryFns.queuedInputs>>>(
-            serverStateKeys.queuedInputs(activeThreadId),
+            serverStateKeys.queuedInputs(composerThreadId),
           )?.inputs ?? [];
         {
           const next = [
@@ -1494,11 +1497,11 @@ export function ChatScreen({ initialPairingUrl, onPairingComplete }: ChatScreenP
           ];
           const extra = next.length - response.queueLength;
           const visibleQueue = extra > 0 ? next.slice(extra) : next;
-          setQueuedInputsState(queryClient, activeThreadId, visibleQueue, response.queueLength);
+          setQueuedInputsState(queryClient, composerThreadId, visibleQueue, response.queueLength);
         }
         setConnection("connected");
         if (!closeStreamRef.current && activeThread?.source === "app") {
-          requestThreadStreamReconnect(activeThreadId);
+          requestThreadStreamReconnect(composerThreadId);
         }
       } catch (caught) {
         syncPairedSessionState();
@@ -1535,7 +1538,7 @@ export function ChatScreen({ initialPairingUrl, onPairingComplete }: ChatScreenP
     threadId?: string;
   }) {
     const runPreferences = currentRuntimePreferences();
-    const queuedThreadId = input.threadId ?? chatStore$.activeThreadId.peek();
+    const queuedThreadId = input.threadId;
     setThreadRunningState(queryClient, queuedThreadId, true);
     let threadId = input.threadId;
     clearQueuedPrompts(queuedThreadId);
@@ -1557,7 +1560,9 @@ export function ChatScreen({ initialPairingUrl, onPairingComplete }: ChatScreenP
         moveNewThreadCollaborationMode(response.thread.id, input.collaborationMode);
         setThreadDetailState(queryClient, response.thread, response.messages);
         setThreadRunningState(queryClient, response.thread.id, true);
-        setActiveThread(response.thread.id);
+        if (chatStore$.activeThreadId.peek() === input.threadId) {
+          setActiveThread(response.thread.id);
+        }
         threadId = response.thread.id;
       }
 

@@ -47,6 +47,7 @@ import {
   setThreadRunningState,
   setThreadsState,
 } from "@/lib/server-state";
+import { consumeHydratedDefaultThread } from "@/lib/server-state-hydration";
 import { evaluateRelayVersion, type RelayVersionCompatibility } from "@/lib/version-policy";
 import { workspaceName } from "@/lib/workspace-name";
 import {
@@ -622,21 +623,25 @@ function useThreadDrawerActions({
 
   const activateSelectedThread = useCallback(
     async (threadId: string, selectionGeneration: number) => {
+      const isCurrentSelection = () =>
+        selectionGeneration === threadSelectionGenerationRef.current &&
+        chatStore$.activeThreadId.peek() === threadId;
+      if (!isCurrentSelection()) {
+        return;
+      }
       const selectedThread = threadsById[threadId];
-      setActiveThread(threadId);
       setThreadMessagesLoading(threadId, true);
       try {
         const response = await fetchThreadState(queryClient, threadId);
-        if (selectionGeneration !== threadSelectionGenerationRef.current) {
+        if (!isCurrentSelection()) {
           return;
         }
-        setActiveThread(response.thread.id);
         if (response.thread.state === "running") {
           requestThreadStreamReconnect(threadId);
         }
         setConnection("connected");
       } catch (caught) {
-        if (selectionGeneration !== threadSelectionGenerationRef.current) {
+        if (!isCurrentSelection()) {
           return;
         }
         syncPairedSessionState();
@@ -655,11 +660,15 @@ function useThreadDrawerActions({
   const selectThread = useCallback(
     (threadId: string) => {
       hapticSelection();
-      navigation.closeDrawer();
       cancelIdleTask(pendingDrawerActionTaskRef.current);
       const selectionGeneration = threadSelectionGenerationRef.current + 1;
       threadSelectionGenerationRef.current = selectionGeneration;
-      if (chatStore$.activeThreadId.peek() === threadId) {
+      const wasSelected = chatStore$.activeThreadId.peek() === threadId;
+      consumeHydratedDefaultThread(threadId);
+      // Select immediately; only loading history waits for the drawer animation.
+      setActiveThread(threadId);
+      navigation.closeDrawer();
+      if (wasSelected) {
         return;
       }
       pendingDrawerActionTaskRef.current = requestIdleTask(() => {

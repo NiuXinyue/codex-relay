@@ -7,6 +7,7 @@ import {
   chatStore$,
   clearQueuedPrompts,
   getCollaborationMode,
+  getComposerSubmission,
   moveNewThreadCollaborationMode,
   mergeActiveThreadInto,
   replaceMessages,
@@ -195,6 +196,48 @@ describe("mobile chat store stream handling", () => {
     );
     expect(chatStore$.activeThreadId.peek()).toBe(activeThread.id);
     expect(chatStore$.threadsById[activeThread.id].state.peek()).toBe("running");
+  });
+
+  it("does not submit a visible composer to a newly selected thread before it renders", () => {
+    setActiveThread("terminal-history");
+    setComposerDraft("Continue the terminal work", "terminal-history");
+    setComposerDraft("Unrelated work", "other-thread");
+
+    setActiveThread("other-thread");
+
+    expect(getComposerSubmission("terminal-history")).toBeUndefined();
+    expect(chatStore$.composerDraftByThreadId.peek()).toEqual({
+      "terminal-history": "Continue the terminal work",
+      "other-thread": "Unrelated work",
+    });
+    expect(getComposerSubmission("other-thread")).toMatchObject({
+      threadId: "other-thread",
+      draft: "Unrelated work",
+    });
+  });
+
+  it("keeps a captured history submission bound to that thread after another selection", () => {
+    setActiveThread("terminal-history");
+    setComposerDraft("Continue the terminal work", "terminal-history");
+    const submission = getComposerSubmission("terminal-history");
+
+    setActiveThread("other-thread");
+
+    expect(submission).toMatchObject({
+      threadId: "terminal-history",
+      draft: "Continue the terminal work",
+    });
+    expect(getComposerSubmission(undefined)).toBeUndefined();
+  });
+
+  it("captures a new conversation without falling back to an existing thread", () => {
+    setActiveThread(undefined);
+    setComposerDraft("Start a new task");
+
+    expect(getComposerSubmission(undefined)).toMatchObject({
+      threadId: undefined,
+      draft: "Start a new task",
+    });
   });
 
   it("keeps queued composer prompts isolated per thread", () => {

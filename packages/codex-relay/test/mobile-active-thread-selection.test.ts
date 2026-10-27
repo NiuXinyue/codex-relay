@@ -8,7 +8,6 @@ describe("mobile active thread refresh selection", () => {
     expect(
       activeThreadAfterRefresh({
         currentActiveThreadId: "thread-current",
-        missingActiveThreadRestored: false,
         threads: [threadSummary("thread-current"), threadSummary("thread-other")],
       }),
     ).toBe("thread-current");
@@ -18,27 +17,33 @@ describe("mobile active thread refresh selection", () => {
     expect(
       activeThreadAfterRefresh({
         currentActiveThreadId: "thread-new",
-        missingActiveThreadRestored: true,
         threads: [threadSummary("thread-older")],
       }),
     ).toBe("thread-new");
   });
 
-  it("falls back to the first refreshed thread only when the current thread cannot be restored", () => {
+  it("keeps an explicitly selected history thread when a refresh cannot restore it", () => {
     expect(
       activeThreadAfterRefresh({
         currentActiveThreadId: "thread-missing",
-        missingActiveThreadRestored: false,
         threads: [threadSummary("thread-fallback")],
       }),
-    ).toBe("thread-fallback");
+    ).toBe("thread-missing");
+  });
+
+  it("keeps the selected history thread when the refreshed page is empty", () => {
+    expect(
+      activeThreadAfterRefresh({
+        currentActiveThreadId: "terminal-history",
+        threads: [],
+      }),
+    ).toBe("terminal-history");
   });
 
   it("replaces a cache-hydrated default with the first fresh server thread", () => {
     expect(
       activeThreadAfterRefresh({
         currentActiveThreadId: "thread-stale-default",
-        missingActiveThreadRestored: false,
         preferFirstThread: true,
         threads: [threadSummary("thread-fresh-default"), threadSummary("thread-stale-default")],
       }),

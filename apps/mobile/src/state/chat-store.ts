@@ -128,6 +128,20 @@ export function getCollaborationMode(threadId = chatStore$.activeThreadId.peek()
   );
 }
 
+export function getComposerSubmission(threadId: string | undefined) {
+  // The visible composer and the selected conversation must still agree.
+  if (threadId !== chatStore$.activeThreadId.peek()) {
+    return undefined;
+  }
+  return {
+    threadId,
+    draft: getComposerDraft(threadId),
+    attachments: getComposerAttachments(threadId),
+    skills: getComposerSkills(threadId),
+    collaborationMode: getCollaborationMode(threadId),
+  };
+}
+
 export function setComposerDraft(draft: string, threadId?: string) {
   const key = composerThreadKey(threadId ?? chatStore$.activeThreadId.peek());
   chatStore$.composerDraftByThreadId.set((current) => {
